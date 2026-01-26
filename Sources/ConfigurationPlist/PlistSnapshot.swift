@@ -13,11 +13,35 @@ import Foundation
 public struct PlistSnapshot: Sendable {
 
     public struct ParsingOptions: FileParsingOptions {
+        /// A decoder for converting string values to byte arrays.
+        public var bytesDecoder: any ConfigBytesFromStringDecoder
+        
+        /// A specifier for determining which configuration values should be treated as secrets.
+        public var secretsSpecifier: SecretsSpecifier<String, any Sendable>
+        
+        public init(
+            bytesDecoder: some ConfigBytesFromStringDecoder = .base64,
+            secretsSpecifier: SecretsSpecifier<String, any Sendable> = .none
+        ) {
+            self.bytesDecoder = bytesDecoder
+            self.secretsSpecifier = secretsSpecifier
+        }
+        
         public static let `default` = ParsingOptions()
     }
 
-    private let values: [String: PlistValue]
+    private let values: [String: ValueWrapper]
+    private let bytesDecoder: any ConfigBytesFromStringDecoder
     public let providerName: String
+
+    struct ValueWrapper: CustomStringConvertible, Sendable {
+        var value: PlistValue
+        var isSecret: Bool
+        
+        var description: String {
+            isSecret ? "<REDACTED>" : "\(value)"
+        }
+    }
 
     enum PlistValue: CustomStringConvertible, Sendable {
         case string(String)
@@ -61,36 +85,50 @@ extension PlistSnapshot: FileConfigSnapshot {
         guard let dict = plist as? [String: Any] else {
             throw PlistError.topLevelNotDictionary
         }
-        self.values = try Self.parseValues(dict, keyPath: [])
+        self.values = try Self.parseValues(dict, keyPath: [], secretsSpecifier: parsingOptions.secretsSpecifier)
+        self.bytesDecoder = parsingOptions.bytesDecoder
         self.providerName = providerName
     }
 
-    private static func parseValues(_ dict: [String: Any], keyPath: [String]) throws -> [String: PlistValue] {
-        var result: [String: PlistValue] = [:]
+    private static func parseValues(
+        _ dict: [String: Any],
+        keyPath: [String],
+        secretsSpecifier: SecretsSpecifier<String, any Sendable>
+    ) throws -> [String: ValueWrapper] {
+        var result: [String: ValueWrapper] = [:]
         for (key, value) in dict {
             let fullKey = (keyPath + [key]).joined(separator: ".")
             switch value {
             case let nested as [String: Any]:
-                let nestedValues = try parseValues(nested, keyPath: keyPath + [key])
+                let nestedValues = try parseValues(nested, keyPath: keyPath + [key], secretsSpecifier: secretsSpecifier)
                 result.merge(nestedValues) { _, new in new }
             case let s as String:
-                result[fullKey] = .string(s)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: s)
+                result[fullKey] = ValueWrapper(value: .string(s), isSecret: isSecret)
             case let i as Int:
-                result[fullKey] = .int(i)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: i)
+                result[fullKey] = ValueWrapper(value: .int(i), isSecret: isSecret)
             case let d as Double:
-                result[fullKey] = .double(d)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: d)
+                result[fullKey] = ValueWrapper(value: .double(d), isSecret: isSecret)
             case let b as Bool:
-                result[fullKey] = .bool(b)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: b)
+                result[fullKey] = ValueWrapper(value: .bool(b), isSecret: isSecret)
             case let data as Data:
-                result[fullKey] = .data(data)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: data)
+                result[fullKey] = ValueWrapper(value: .data(data), isSecret: isSecret)
             case let arr as [String]:
-                result[fullKey] = .stringArray(arr)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: arr)
+                result[fullKey] = ValueWrapper(value: .stringArray(arr), isSecret: isSecret)
             case let arr as [Int]:
-                result[fullKey] = .intArray(arr)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: arr)
+                result[fullKey] = ValueWrapper(value: .intArray(arr), isSecret: isSecret)
             case let arr as [Double]:
-                result[fullKey] = .doubleArray(arr)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: arr)
+                result[fullKey] = ValueWrapper(value: .doubleArray(arr), isSecret: isSecret)
             case let arr as [Bool]:
-                result[fullKey] = .boolArray(arr)
+                let isSecret = secretsSpecifier.isSecret(key: fullKey, value: arr)
+                result[fullKey] = ValueWrapper(value: .boolArray(arr), isSecret: isSecret)
             default:
                 throw PlistError.unsupportedType(fullKey, String(describing: type(of: value)))
             }
@@ -103,9 +141,10 @@ extension PlistSnapshot: FileConfigSnapshot {
 extension PlistSnapshot: ConfigSnapshot {
     public func value(forKey key: AbsoluteConfigKey, type: ConfigType) throws -> LookupResult {
         let encodedKey = key.components.joined(separator: ".")
-        guard let plistValue = values[encodedKey] else {
+        guard let wrapper = values[encodedKey] else {
             return LookupResult(encodedKey: encodedKey, value: nil)
         }
+        let plistValue = wrapper.value
         let content: ConfigContent = switch (type, plistValue) {
         case (.string, .string(let s)): .string(s)
         case (.int, .int(let i)): .int(i)
@@ -115,7 +154,12 @@ extension PlistSnapshot: ConfigSnapshot {
         case (.bool, .bool(let b)): .bool(b)
         case (.bool, .int(let i)): .bool(i != 0)
         case (.bytes, .data(let d)): .bytes([UInt8](d))
-        case (.bytes, .string(let s)): .bytes([UInt8](s.utf8))
+        case (.bytes, .string(let s)):
+            if let decoded = bytesDecoder.decode(s) {
+                .bytes(decoded)
+            } else {
+                throw PlistError.typeMismatch(encodedKey, type)
+            }
         case (.stringArray, .stringArray(let a)): .stringArray(a)
         case (.intArray, .intArray(let a)): .intArray(a)
         case (.doubleArray, .doubleArray(let a)): .doubleArray(a)
@@ -123,7 +167,7 @@ extension PlistSnapshot: ConfigSnapshot {
         default:
             throw PlistError.typeMismatch(encodedKey, type)
         }
-        return LookupResult(encodedKey: encodedKey, value: ConfigValue(content, isSecret: false))
+        return LookupResult(encodedKey: encodedKey, value: ConfigValue(content, isSecret: wrapper.isSecret))
     }
 }
 
