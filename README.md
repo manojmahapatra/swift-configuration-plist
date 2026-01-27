@@ -59,6 +59,10 @@ Then add `ConfigurationPlist` to your target dependencies.
 
 Access as `http.timeout` and `features.darkMode`.
 
+## AI Use Disclaimer
+
+This package was built with AI assistance and reviewed by a human. For AI contribution rules, see [AI Disclosure Rules](CONTRIBUTING.md#ai-disclosure-rules).
+
 ## License
 
 Apache 2.0
